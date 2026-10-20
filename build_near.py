@@ -1,65 +1,44 @@
-name: build-near
+#!/usr/bin/env python3
+"""
+build_near.py - builds hassle_near.c into libHassleExtended_arm64.so and libHassleExtended_arm32.so with Android NDK.
 
-on:
-  workflow_dispatch:
-  push:
-    branches: [main, master]
+  python build_near.py [path_to_NDK]
+"""
+import glob, os, platform, subprocess, sys
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+here = os.path.dirname(os.path.abspath(__file__))
+src = os.path.join(here, 'hassle_near.c')
 
-      - name: Собрать libHassleExtended (arm64 + arm32) через NDK раннера
-        run: |
-          echo "NDK: $ANDROID_NDK_LATEST_HOME"
-          python3 build_near.py "$ANDROID_NDK_LATEST_HOME"
-          mkdir -p out
-          cp libHassleExtended_arm64.so libHassleExtended_arm32.so out/
+def find_ndk():
+    if len(sys.argv) > 1: return sys.argv[1]
+    for k in ('ANDROID_NDK_HOME', 'ANDROID_NDK_ROOT', 'ANDROID_NDK'):
+        if os.environ.get(k): return os.environ[k]
+    sdks = [os.environ.get('ANDROID_HOME'), os.environ.get('ANDROID_SDK_ROOT'),
+            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Android', 'Sdk'),
+            os.path.expanduser('~/Android/Sdk'), os.path.expanduser('~/Library/Android/sdk')]
+    for s in sdks:
+        if s:
+            c = sorted(glob.glob(os.path.join(s, 'ndk', '*')))
+            if c: return c[-1]
+    sys.exit('NDK not found. Pass the path as an argument.')
 
-      - name: Выложить .so
-        uses: actions/upload-artifact@v4
-        with:
-          name: near-so
-          path: out/*.so
+ndk = find_ndk()
+host = {'Windows': 'windows-x86_64', 'Linux': 'linux-x86_64', 'Darwin': 'darwin-x86_64'}[platform.system()]
+clang = os.path.join(ndk, 'toolchains', 'llvm', 'prebuilt', host, 'bin', 'clang' + ('.exe' if os.name == 'nt' else ''))
+if not os.path.exists(clang):
+    sys.exit('clang not found: ' + clang)
 
-      # --- дальше только если в папку apk/ закинуты части Hassle_Online_..._apk.001, .002, ... ---
-      - name: Есть ли APK
-        id: hasapk
-        run: |
-          if ls apk/*.001 >/dev/null 2>&1; then echo "yes=1" >> "$GITHUB_OUTPUT"; fi
-
-      - name: Вшить мод в APK
-        if: steps.hasapk.outputs.yes == '1'
-        run: |
-          python3 patch_apk.py "$(ls apk/*.001 | head -1)" out/unsigned.apk \
-            --arm64 libHassleExtended_arm64.so --arm32 libHassleExtended_arm32.so
-
-      - name: Подписать APK
-        if: steps.hasapk.outputs.yes == '1'
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
-        run: |
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          PASS="${KEYSTORE_PASS:-hassle123}"
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > ks.jks
-          else
-            keytool -genkeypair -keystore ks.jks -alias hassle -keyalg RSA -keysize 2048 -validity 36500 \
-              -storepass "$PASS" -keypass "$PASS" -dname "CN=Hassle Near"
-            cp ks.jks out/keystore-SAVE-ME.jks
-          fi
-          "$BT/apksigner" sign --ks ks.jks --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
-            --out out/Hassle_Online_near_signed.apk out/unsigned.apk
-          "$BT/apksigner" verify -v out/Hassle_Online_near_signed.apk | head -5
-
-      - name: Выложить APK
-        if: steps.hasapk.outputs.yes == '1'
-        uses: actions/upload-artifact@v4
-        with:
-          name: apk-signed
-          path: |
-            out/Hassle_Online_near_signed.apk
-            out/keystore-SAVE-ME.jks
+targets = [
+    ('arm64', 'aarch64-linux-android21', ['-Wl,-z,max-page-size=16384']),
+    ('arm32', 'armv7a-linux-androideabi21', []),
+]
+for name, tgt, extra in targets:
+    out = os.path.join(here, 'libHassleExtended_%s.so' % name)
+    cmd = [clang, '--target=' + tgt, '-O2', '-shared', '-fPIC', '-fvisibility=hidden', '-fno-stack-protector',
+           '-Wall', '-Wno-unused-function', '-Wl,-soname,libHassleExtended.so', '-Wl,--build-id=none', '-s',
+           src, '-o', out] + extra
+    print('>', name)
+    r = subprocess.run(cmd)
+    if r.returncode: sys.exit('build %s failed' % name)
+    print('   ', out, os.path.getsize(out), 'bytes')
+print('done')
