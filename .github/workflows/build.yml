@@ -1,0 +1,25 @@
+name: build-near
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build libHassleExtended (arm64 + arm32) with runner NDK
+        run: |
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
+          python3 build_near.py "$ANDROID_NDK_LATEST_HOME"
+          mkdir -p out
+          cp libHassleExtended_arm64.so libHassleExtended_arm32.so out/
+
+      - name: Upload .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: near-so
+          path: out/*.so
