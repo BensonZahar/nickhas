@@ -38,11 +38,14 @@ extern long send(int, const void*, unsigned long, int);
 extern int close(int);
 extern int pthread_create(unsigned long*, const void*, void* (*)(void*), void*);
 extern int usleep(unsigned);
+extern int open(const char*, int, ...);
+extern long read(int, void*, unsigned long);
 
 #define RTLD_NOW_ 2
 #define NEAR_PORT_FIRST 17771
 #define NEAR_PORT_COUNT 10
 #define TICK_US 300000
+#define START_DELAY_S 60      /* столько секунд мод вообще не трогает IL2CPP после загрузки (игра ещё инициализируется) */
 
 /* ───────────── мелкие строковые помощники (без libc) ───────────── */
 static unsigned slen(const char* s) { unsigned n = 0; while (s && s[n]) n++; return n; }
@@ -166,7 +169,7 @@ static int il2cpp_open(void) {
 #ifdef NEAR_TEST
     g_il2cpp = dlopen(NULL, RTLD_NOW_);
 #else
-    g_il2cpp = dlopen("libil2cpp.so", RTLD_NOW_);
+    g_il2cpp = dlopen("libil2cpp.so", RTLD_NOW_ | 4);   /* RTLD_NOLOAD: только если игра уже загрузила, сами не грузим */
 #endif
     if (!g_il2cpp) return 0;
     LOAD(domain_get); LOAD(thread_attach); LOAD(domain_get_assemblies); LOAD(assembly_get_image);
@@ -599,13 +602,39 @@ static void collect_tick(void) {
     publish(1, g_stage, havePos, me[0], me[1], me[2], meId);
 }
 
+static void init_log(void) {
+    void* lg;
+    if (g_alog) return;
+    lg = dlopen("liblog.so", RTLD_NOW_);
+    if (lg) *(void**)&g_alog = dlsym(lg, "__android_log_write");
+}
+
+/* Выключатель для диагностики: если существует файл near_off, мод ничего не запускает (работает только подмена оригинала).
+   /sdcard/Android/data/<пакет>/files/near_off  или  /data/local/tmp/near_off */
+static int off_switch(void) {
+    char cmd[128], path[256]; Buf b; int fd; long n, i;
+    fd = open("/data/local/tmp/near_off", 0);
+    if (fd >= 0) { close(fd); return 1; }
+    fd = open("/proc/self/cmdline", 0);
+    if (fd < 0) return 0;
+    n = read(fd, cmd, sizeof cmd - 1); close(fd);
+    if (n <= 0) return 0;
+    cmd[n] = 0;
+    for (i = 0; cmd[i]; i++) if (cmd[i] == ':') { cmd[i] = 0; break; }
+    b_init(&b, path, sizeof path);
+    b_s(&b, "/sdcard/Android/data/"); b_s(&b, cmd); b_s(&b, "/files/near_off");
+    fd = open(path, 0);
+    if (fd >= 0) { close(fd); return 1; }
+    return 0;
+}
+
 static void* collector_main(void* arg) {
+    int w;
     (void)arg;
-    {
-        void* lg = dlopen("liblog.so", RTLD_NOW_);
-        if (lg) *(void**)&g_alog = dlsym(lg, "__android_log_write");
-    }
-    dlog("collector: старт");
+    init_log();
+    dlog("collector: старт, пауза перед первым чтением IL2CPP");
+    for (w = 0; w < START_DELAY_S; w++) usleep(1000000);
+    dlog("collector: пауза закончилась, начинаю");
     for (;;) {
         collect_tick();
         usleep(TICK_US);
@@ -681,6 +710,9 @@ static void start_threads(void) {
     unsigned long t1 = 0, t2 = 0;
     if (g_started) return;
     g_started = 1;
+    init_log();
+    if (off_switch()) { dlog("near_off найден: мод отключён, работает только оригинал"); return; }
+    dlog("start_threads: запускаю сервер и сборщик");
     pthread_create(&t1, NULL, server_main, NULL);
     pthread_create(&t2, NULL, collector_main, NULL);
 }
@@ -693,12 +725,17 @@ static void* g_orig;
 /* Оригинальный мод лежит рядом под именем libHassleExtend2.so */
 EXPORT int JNI_OnLoad(void* vm, void* reserved) {
     int ver = 0x00010006;                                  /* JNI_VERSION_1_6 */
+    init_log();
+    dlog("JNI_OnLoad: вход, грузим оригинал libHassleExtend2.so");
     g_orig = dlopen("libHassleExtend2.so", RTLD_NOW_);
     if (g_orig) {
         jni_onload_t f = (jni_onload_t)dlsym(g_orig, "JNI_OnLoad");
+        dlog("JNI_OnLoad: оригинал загружен, вызываю его JNI_OnLoad");
         if (f) ver = f(vm, reserved);
-    }
+        dlog_i("JNI_OnLoad: оригинал вернул версию ", ver);
+    } else dlog("JNI_OnLoad: оригинал libHassleExtend2.so НЕ загрузился");
     start_threads();
+    dlog("JNI_OnLoad: выход");
     return ver;
 }
 EXPORT void JNI_OnUnload(void* vm, void* reserved) {
