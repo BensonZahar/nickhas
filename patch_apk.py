@@ -1,11 +1,151 @@
-# Сборка через GitHub Actions
+#!/usr/bin/env python3
+"""
+patch_apk.py — вшивает мод «игроки рядом» в Hassle_Online APK.
 
-1. Создайте **приватный** репозиторий на github.com и загрузите в него содержимое этой папки (включая `.github/workflows/build.yml`).
-2. Вкладка **Actions** -> `build-near` -> **Run workflow**. Через 1–2 минуты в Artifacts появится `near-so` (два `.so`).
-3. Скачайте `near-so`, положите `.so` рядом с `patch_apk.py` и локально выполните (NDK не нужен, только Python):
-   `python patch_apk.py Hassle_Online_1_8_5_rec_focus_apk.001 out_unsigned.apk --arm64 libHassleExtended_arm64.so --arm32 libHassleExtended_arm32.so`
-   затем подпишите (`uber-apk-signer -a out_unsigned.apk`).
+  python patch_apk.py Hassle_Online_1_8_5_rec_focus_apk.001 out_unsigned.apk --arm64 libHassleExtended_arm64.so [--arm32 libHassleExtended_arm32.so]
 
-## Если хотите, чтобы APK собрал и подписал GitHub
-Закиньте части `.001`–`.005` в папку `apk/` через `git push` (веб-загрузка принимает файлы до 25 МБ, а части по 28 МБ; лимит git — 100 МБ на файл). Репозиторий обязательно приватный. Тогда в Artifacts появится `apk-signed`.
-Ключ подписи: без секретов на каждый запуск создаётся новый ключ (кладётся в артефакт `keystore-SAVE-ME.jks`), и обновить APK поверх прошлой сборки не получится. Чтобы ключ был постоянным, сохраните его в Settings -> Secrets: `KEYSTORE_B64` (`base64 -w0 ks.jks`) и `KEYSTORE_PASS`.
+Что делает
+  • если на входе .001 — склеивает части (.001, .002, ...) в память/временный файл;
+  • для каждой ABI: lib/<abi>/libHassleExtended.so переименовывает в libHassleExtend2.so
+    (наш мод при загрузке сам подгрузит его и передаст JNI_OnLoad), а на его место кладёт новый .so;
+    если оригинала для этой ABI нет — просто добавляет новый;
+  • убирает старую подпись META-INF (MANIFEST.MF, *.SF, *.RSA/DSA/EC);
+  • .so пишет без сжатия и с выравниванием 4096, остальное выравнивает по 4 (как zipalign);
+  • остальные записи копирует байт-в-байт, без перепаковки.
+После этого APK надо подписать (apksigner / uber-apk-signer) — см. README.
+"""
+import argparse, glob, os, re, struct, sys, tempfile, zlib, zipfile
+
+def join_parts(first):
+    m = re.match(r'^(.*)\.(\d{3})$', first)
+    if not m:
+        return first, False
+    base = m.group(1)
+    parts = sorted(glob.glob(base + '.[0-9][0-9][0-9]'))
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.apk')
+    for p in parts:
+        with open(p, 'rb') as f:
+            while True:
+                b = f.read(1 << 22)
+                if not b: break
+                tmp.write(b)
+    tmp.close()
+    print('склеено частей: %d -> %s' % (len(parts), tmp.name))
+    return tmp.name, True
+
+ABIS = {'arm64': 'arm64-v8a', 'arm32': 'armeabi-v7a'}
+SIG_RE = re.compile(r'^META-INF/[^/]+\.(SF|RSA|DSA|EC)$|^META-INF/MANIFEST\.MF$', re.I)
+
+class Ent:
+    __slots__ = ('name', 'method', 'crc', 'csize', 'usize', 'flags', 'dt', 'dd', 'src', 'data', 'ext_attr')
+
+def read_entries(path):
+    ents = []
+    with zipfile.ZipFile(path) as z, open(path, 'rb') as f:
+        for zi in z.infolist():
+            f.seek(zi.header_offset)
+            h = f.read(30)
+            if h[:4] != b'PK\x03\x04':
+                sys.exit('битый локальный заголовок: ' + zi.filename)
+            nlen, elen = struct.unpack('<HH', h[26:30])
+            e = Ent()
+            e.name = zi.filename
+            e.method = zi.compress_type
+            e.crc = zi.CRC
+            e.csize = zi.compress_size
+            e.usize = zi.file_size
+            e.flags = zi.flag_bits & ~0x08 | 0x800 if any(ord(c) > 127 for c in zi.filename) else zi.flag_bits & ~0x08
+            e.dt = (zi.date_time)
+            e.src = (zi.header_offset + 30 + nlen + elen, zi.compress_size)
+            e.data = None
+            e.ext_attr = zi.external_attr
+            ents.append(e)
+    return ents
+
+def new_entry(name, blob):
+    e = Ent()
+    e.name = name; e.method = 0
+    e.crc = zlib.crc32(blob) & 0xffffffff
+    e.csize = e.usize = len(blob)
+    e.flags = 0
+    e.dt = (2026, 1, 1, 0, 0, 0)
+    e.src = None; e.data = blob; e.ext_attr = 0o100644 << 16
+    return e
+
+def dos(dt):
+    y, mo, d, h, mi, s = dt
+    return ((max(y, 1980) - 1980) << 9 | mo << 5 | d) & 0xffff, (h << 11 | mi << 5 | s // 2) & 0xffff
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('inp'); ap.add_argument('out')
+    ap.add_argument('--arm64'); ap.add_argument('--arm32')
+    a = ap.parse_args()
+    if not a.arm64 and not a.arm32:
+        sys.exit('нужен хотя бы один из --arm64 / --arm32')
+    src_path, tmp = join_parts(a.inp)
+    ents = read_entries(src_path)
+    libs = {}
+    if a.arm64: libs['arm64-v8a'] = open(a.arm64, 'rb').read()
+    if a.arm32: libs['armeabi-v7a'] = open(a.arm32, 'rb').read()
+
+    out_ents = []
+    for e in ents:
+        if SIG_RE.match(e.name):
+            print('убрана подпись:', e.name); continue
+        out_ents.append(e)
+    for abi, blob in libs.items():
+        orig = 'lib/%s/libHassleExtended.so' % abi
+        moved = False
+        for e in out_ents:
+            if e.name == orig:
+                e.name = 'lib/%s/libHassleExtend2.so' % abi
+                moved = True; break
+        print('%s: оригинал %s' % (abi, 'переименован в libHassleExtend2.so' if moved else 'не найден — добавляю только наш'))
+        out_ents.append(new_entry(orig, blob))
+
+    with open(src_path, 'rb') as fin, open(a.out, 'wb') as fo:
+        cd = []
+        for e in out_ents:
+            nm = e.name.encode('utf-8')
+            fl = e.flags | (0x800 if any(b > 127 for b in nm) else 0)
+            off = fo.tell()
+            align = 0
+            if e.method == 0:
+                align = 4096 if e.name.endswith('.so') else 4
+            pad = 0
+            if align:
+                pad = (-(off + 30 + len(nm))) % align
+                if 0 < pad < 4: pad += align
+            extra = b''
+            if pad:
+                extra = struct.pack('<HH', 0xD935, pad - 4) + b'\0' * (pad - 4)
+            d, t = dos(e.dt)[0], dos(e.dt)[1]
+            ver = 20
+            fo.write(struct.pack('<4sHHHHHIIIHH', b'PK\x03\x04', ver, fl, e.method, t, d, e.crc, e.csize, e.usize, len(nm), len(extra)))
+            fo.write(nm); fo.write(extra)
+            if e.data is not None:
+                fo.write(e.data)
+            else:
+                fin.seek(e.src[0]); left = e.src[1]
+                while left:
+                    b = fin.read(min(left, 1 << 22))
+                    if not b: sys.exit('обрыв данных: ' + e.name)
+                    fo.write(b); left -= len(b)
+            cd.append((e, nm, fl, off, d, t, ver))
+        cd_off = fo.tell()
+        for e, nm, fl, off, d, t, ver in cd:
+            fo.write(struct.pack('<4sHHHHHHIIIHHHHHII', b'PK\x01\x02', 0x031E, ver, fl, e.method, t, d, e.crc, e.csize, e.usize,
+                                 len(nm), 0, 0, 0, 0, e.ext_attr & 0xffffffff, off))
+            fo.write(nm)
+        cd_size = fo.tell() - cd_off
+        fo.write(struct.pack('<4sHHHHIIH', b'PK\x05\x06', 0, 0, len(cd), len(cd), cd_size, cd_off, 0))
+    if tmp: os.unlink(src_path)
+    # самопроверка
+    with zipfile.ZipFile(a.out) as z:
+        bad = z.testzip()
+        if bad: sys.exit('ОШИБКА целостности: ' + bad)
+    print('готово:', a.out, '(%.1f МБ) — теперь подпишите APK' % (os.path.getsize(a.out) / 1e6))
+
+if __name__ == '__main__':
+    main()
