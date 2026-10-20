@@ -10,6 +10,10 @@
  *   • Второй поток — крошечный HTTP-сервер на 127.0.0.1:17771 (порты 17771..17780). HUD (Code3.js) опрашивает
  *     http://127.0.0.1:17771/near  и получает JSON. Ничего из IL2CPP на главный поток не навешивается — игру это не трогает.
  *
+ *   • Голос игроков: если в APK подменён libopus.so на прокси (hassle_opus.c), то GET /voice?since=N отдаёт накопленные
+ *     Opus-пакеты входящего голоса (JSON, base64) — Code3.js собирает из них OGG и шлёт в Telegram. since=-1 — только узнать
+ *     номер последнего события. Без прокси /voice отвечает {"ok":0,"why":"no-proxy"}. Диагностика голоса — в конце /diag.
+ *
  * Только IL2CPP C API (экспортируется libil2cpp.so) — исходники игры и BNM не нужны, классы ищутся по имени.
  * Код не использует libc-заголовки: прототипы объявлены вручную, поэтому собирается обычным clang без NDK.
  */
@@ -665,6 +669,57 @@ static void respond(int fd, const char* status, const char* ctype, const char* b
     if (send_all(fd, h, b.n) && blen) send_all(fd, body, blen);
 }
 
+/* ───────────── голос: связь с прокси libopus.so (hassle_opus.c) ───────────── */
+typedef int (*voice_pull_t)(unsigned long long, char*, int);
+typedef int (*voice_info_t)(char*, int);
+static voice_pull_t g_vpull;
+static voice_info_t g_vinfo;
+static int g_vmiss_logged;
+static char g_voice_out[196608];
+static char g_diag_out[24576 + 1024];
+
+static void voice_resolve(void) {
+    void* h;
+    if (g_vpull) return;
+    h = dlopen("libopus.so", RTLD_NOW_ | 4);                 /* RTLD_NOLOAD: только если игра уже загрузила libopus.so */
+    if (!h) return;
+    *(void**)&g_vpull = dlsym(h, "hassle_voice_pull");
+    *(void**)&g_vinfo = dlsym(h, "hassle_voice_info");
+    if (g_vpull) dlog("голос: прокси libopus найден");
+    else if (!g_vmiss_logged) { g_vmiss_logged = 1; dlog("голос: libopus.so загружен, но это НЕ прокси (нет hassle_voice_pull) — APK собран без --opus-*"); }
+}
+static const char* sfind(const char* h, const char* n) {
+    for (; *h; h++) if (sprefix(h, n)) return h;
+    return NULL;
+}
+static void handle_voice(int c, const char* rq) {
+    unsigned long long since = 0; const char* q = sfind(rq, "since=");
+    int n;
+    if (q) {
+        q += 6;
+        if (*q == '-') since = ~0ULL;                          /* since=-1: только номер последнего события */
+        else while (*q >= '0' && *q <= '9') { since = since * 10 + (unsigned long long)(*q - '0'); q++; }
+    }
+    voice_resolve();
+    if (!g_vpull) {
+        const char* j = "{\"v\":1,\"ok\":0,\"why\":\"no-proxy\"}";
+        respond(c, "200 OK", "application/json", j, slen(j));
+        return;
+    }
+    n = g_vpull(since, g_voice_out, (int)sizeof g_voice_out);
+    respond(c, "200 OK", "application/json", g_voice_out, (unsigned)n);
+}
+static void handle_diag(int c) {
+    Buf b;
+    b_init(&b, g_diag_out, sizeof g_diag_out);
+    if (g_diag_ready) { unsigned i; for (i = 0; i < (unsigned)g_diag.n && b.n + 1 < b.cap; i++) b_ch(&b, g_diag_mem[i]); }
+    voice_resolve();
+    b_s(&b, "\n== голос ==\n");
+    if (g_vinfo) { char t[768]; g_vinfo(t, (int)sizeof t); b_s(&b, t); }
+    else b_s(&b, "прокси libopus не найден (или игра ещё не загрузила libopus.so)\n");
+    respond(c, "200 OK", "text/plain; charset=utf-8", g_diag_out, b.n);
+}
+
 static int g_port;
 static void* server_main(void* arg) {
     int fd = -1, i, one = 1;
@@ -694,7 +749,8 @@ static void* server_main(void* arg) {
                 rq[n] = 0;
                 if (sprefix(rq, "OPTIONS ")) respond(c, "204 No Content", "text/plain", "", 0);
                 else if (sprefix(rq, "GET /near")) { const char* j = g_json[g_jsonCur]; respond(c, "200 OK", "application/json", j, slen(j)); }
-                else if (sprefix(rq, "GET /diag")) { respond(c, "200 OK", "text/plain; charset=utf-8", g_diag_mem, g_diag_ready ? g_diag.n : 0); }
+                else if (sprefix(rq, "GET /voice")) handle_voice(c, rq);
+                else if (sprefix(rq, "GET /diag")) handle_diag(c);
                 else if (sprefix(rq, "GET /ping")) respond(c, "200 OK", "text/plain", "hassle-near", 11);
                 else respond(c, "404 Not Found", "text/plain", "no", 2);
             }

@@ -3,6 +3,7 @@
 patch_apk.py — вшивает мод «игроки рядом» в Hassle_Online APK.
 
   python patch_apk.py Hassle_Online_1_8_5_rec_focus_apk.001 out_unsigned.apk --arm64 libHassleExtended_arm64.so [--arm32 libHassleExtended_arm32.so]
+                      [--opus-arm64 libopus_proxy_arm64.so] [--opus-arm32 libopus_proxy_arm32.so]
 
 Что делает
   • если на входе .001 — склеивает части (.001, .002, ...) в память/временный файл;
@@ -11,6 +12,8 @@ patch_apk.py — вшивает мод «игроки рядом» в Hassle_Onl
     если оригинала для этой ABI нет — просто добавляет новый;
   • убирает старую подпись META-INF (MANIFEST.MF, *.SF, *.RSA/DSA/EC);
   • .so пишет без сжатия и с выравниванием 4096, остальное выравнивает по 4 (как zipalign);
+  • --opus-*: (голос в Telegram) настоящий lib/<abi>/libopus.so кладёт под именем libopuz.so (в нём правится SONAME
+    libopus.so → libopuz.so), а на место libopus.so ставит прокси hassle_opus.c, который копит входящие Opus-пакеты;
   • остальные записи копирует байт-в-байт, без перепаковки.
 После этого APK надо подписать (apksigner / uber-apk-signer) — см. README.
 """
@@ -35,6 +38,50 @@ def join_parts(first):
 
 ABIS = {'arm64': 'arm64-v8a', 'arm32': 'armeabi-v7a'}
 SIG_RE = re.compile(r'^META-INF/[^/]+\.(SF|RSA|DSA|EC)$|^META-INF/MANIFEST\.MF$', re.I)
+
+def patch_soname(blob, old, new):
+    """Меняет DT_SONAME в ELF (32/64 бит, little-endian) на строку той же длины. Возвращает новые байты."""
+    assert len(old) == len(new)
+    b = bytearray(blob)
+    if b[:4] != b'\x7fELF': sys.exit('не ELF')
+    is64 = b[4] == 2
+    if is64:
+        phoff = struct.unpack_from('<Q', b, 0x20)[0]; phentsize, phnum = struct.unpack_from('<HH', b, 0x36); ptr = 8
+    else:
+        phoff = struct.unpack_from('<I', b, 0x1C)[0]; phentsize, phnum = struct.unpack_from('<HH', b, 0x2A); ptr = 4
+    loads, dyn = [], None
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        if is64:
+            t_, fl, po, pv, pp, pfs, pms, al = struct.unpack_from('<IIQQQQQQ', b, o)
+        else:
+            t_, po, pv, pp, pfs, pms, fl, al = struct.unpack_from('<IIIIIIII', b, o)
+        if t_ == 1: loads.append((pv, po, pfs))
+        if t_ == 2: dyn = (po, pfs)
+    if not dyn: sys.exit('нет PT_DYNAMIC')
+    def v2o(v):
+        for pv, po, pfs in loads:
+            if pv <= v < pv + pfs: return v - pv + po
+        sys.exit('адрес вне сегментов')
+    strtab = soname = None
+    esz = 16 if is64 else 8
+    for o in range(dyn[0], dyn[0] + dyn[1], esz):
+        tag, val = struct.unpack_from('<qQ' if is64 else '<iI', b, o)
+        if tag == 5: strtab = val
+        if tag == 14: soname = val
+        if tag == 0: break
+    if strtab is None or soname is None: sys.exit('нет DT_STRTAB/DT_SONAME')
+    so = v2o(strtab) + soname
+    cur = bytes(b[so:so + len(old) + 1])
+    if cur != old.encode() + b'\0': sys.exit('SONAME не %s: %r' % (old, cur))
+    b[so:so + len(new)] = new.encode()
+    return bytes(b)
+
+def entry_bytes(e, fin):
+    fin.seek(e.src[0]); raw = fin.read(e.src[1])
+    if e.method == 0: return raw
+    if e.method == 8: return zlib.decompress(raw, -15)
+    sys.exit('метод сжатия %d не поддержан: %s' % (e.method, e.name))
 
 class Ent:
     __slots__ = ('name', 'method', 'crc', 'csize', 'usize', 'flags', 'dt', 'dd', 'src', 'data', 'ext_attr')
@@ -80,6 +127,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('inp'); ap.add_argument('out')
     ap.add_argument('--arm64'); ap.add_argument('--arm32')
+    ap.add_argument('--opus-arm64', dest='opus64'); ap.add_argument('--opus-arm32', dest='opus32')
     a = ap.parse_args()
     if not a.arm64 and not a.arm32:
         sys.exit('нужен хотя бы один из --arm64 / --arm32')
@@ -103,6 +151,21 @@ def main():
                 moved = True; break
         print('%s: оригинал %s' % (abi, 'переименован в libHassleExtend2.so' if moved else 'не найден — добавляю только наш'))
         out_ents.append(new_entry(orig, blob))
+
+    opus = {}
+    if a.opus64: opus['arm64-v8a'] = open(a.opus64, 'rb').read()
+    if a.opus32: opus['armeabi-v7a'] = open(a.opus32, 'rb').read()
+    with open(src_path, 'rb') as fin:
+        for abi, proxy in opus.items():
+            orig = 'lib/%s/libopus.so' % abi
+            real = next((e for e in out_ents if e.name == orig), None)
+            if real is None:
+                print('%s: в APK нет %s — прокси голоса пропущен' % (abi, orig)); continue
+            blob = patch_soname(entry_bytes(real, fin), 'libopus.so', 'libopuz.so')
+            out_ents.remove(real)
+            out_ents.append(new_entry('lib/%s/libopuz.so' % abi, blob))
+            out_ents.append(new_entry(orig, proxy))
+            print('%s: настоящий libopus.so -> libopuz.so (SONAME исправлен), на его месте прокси голоса (%d байт)' % (abi, len(proxy)))
 
     with open(src_path, 'rb') as fin, open(a.out, 'wb') as fo:
         cd = []

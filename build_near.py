@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-build_near.py - builds hassle_near.c into libHassleExtended_arm64.so and libHassleExtended_arm32.so with Android NDK.
+build_near.py - builds with Android NDK:
+  hassle_near.c  -> libHassleExtended_arm64.so / libHassleExtended_arm32.so   (мод «игроки рядом» + HTTP)
+  hassle_opus.c  -> libopus_proxy_arm64.so / libopus_proxy_arm32.so            (прокси libopus.so: голос игроков → Telegram)
 
   python build_near.py [path_to_NDK]
 """
@@ -8,6 +10,7 @@ import glob, os, platform, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
 src = os.path.join(here, 'hassle_near.c')
+src_opus = os.path.join(here, 'hassle_opus.c')
 
 def find_ndk():
     if len(sys.argv) > 1: return sys.argv[1]
@@ -40,5 +43,14 @@ for name, tgt, extra in targets:
     print('>', name)
     r = subprocess.run(cmd)
     if r.returncode: sys.exit('build %s failed' % name)
+    print('   ', out, os.path.getsize(out), 'bytes')
+for name, tgt, extra in targets:
+    out = os.path.join(here, 'libopus_proxy_%s.so' % name)
+    cmd = [clang, '--target=' + tgt, '-O2', '-shared', '-fPIC', '-fvisibility=hidden', '-fno-stack-protector',
+           '-Wall', '-Wno-unused-function', '-Wl,-soname,libopus.so', '-Wl,--build-id=none', '-s',
+           src_opus, '-o', out] + extra
+    print('> opus proxy', name)
+    r = subprocess.run(cmd)
+    if r.returncode: sys.exit('build opus proxy %s failed' % name)
     print('   ', out, os.path.getsize(out), 'bytes')
 print('done')
