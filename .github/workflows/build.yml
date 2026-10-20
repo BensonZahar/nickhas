@@ -27,11 +27,11 @@ jobs:
           ls "$NDK/toolchains/llvm/prebuilt/"
           echo "NDK_PATH=$NDK" >> "$GITHUB_ENV"
 
-      - name: Build libHassleExtended (arm64 + arm32)
+      - name: Build libHassleExtended + libopus proxy (arm64 + arm32)
         run: |
           python3 build_near.py "$NDK_PATH"
           mkdir -p out
-          cp libHassleExtended_arm64.so libHassleExtended_arm32.so out/
+          cp libHassleExtended_arm64.so libHassleExtended_arm32.so libopus_proxy_arm64.so libopus_proxy_arm32.so out/
 
       - name: Upload .so
         uses: actions/upload-artifact@v4
